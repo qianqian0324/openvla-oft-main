@@ -27,6 +27,8 @@ from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq,
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import wandb
+from torch.utils.tensorboard import SummaryWriter ###
+import subprocess
 
 from experiments.robot.openvla_utils import (
     check_model_logic_mismatch,
@@ -337,7 +339,7 @@ def run_forward_pass(
     else:
         noise, noisy_actions, diffusion_timestep_embeddings = None, None, None
 
-    # ========== [1] 视觉输入处理 ==========
+    # ========== 视觉输入处理 ==========
     if use_film:
         base_model = getattr(vla, "base_model", None)
         if base_model is None and hasattr(vla, "module"):
@@ -801,7 +803,7 @@ def run_validation(
     Returns:
         None.
     """
-    print("[DEBUG] Entering eval-only mode...")
+    #print("[DEBUG] Entering eval-only mode...")
     val_start_time = time.time()
     vla.eval()
     action_head.eval()
@@ -885,11 +887,12 @@ def finetune(cfg: FinetuneConfig) -> None:
     run_id = get_run_id(cfg)
 
     # Create experiment run directory
-    run_dir = cfg.run_root_dir / run_id
-    os.makedirs(run_dir, exist_ok=True)
+    run_dir = Path("tensorboard_logs") / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # Initialize TensorBoard writer
+    tb_writer = SummaryWriter(log_dir=str(run_dir))
 
     # GPU setup
-    #device_id = 0 ###
     distributed_state = PartialState(cpu=False, backend=None) ###
     device_id = distributed_state.local_process_index
     torch.cuda.set_device(device_id)
@@ -962,10 +965,9 @@ def finetune(cfg: FinetuneConfig) -> None:
     )
     #print("[DEBUG] 模型主干类型:", type(vla.vision_backbone))
     # Set number of images in VLA input
-    # === 设置视觉主干图像数量 ===
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
 
-# === LoRA 包裹（如果需要）===
+    # LoRA setup
     if cfg.use_lora:
         lora_config = LoraConfig(
             r=cfg.lora_rank,
@@ -977,7 +979,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
 
-## === FiLM 设置 ===
+    # === FiLM 设置 ===
     if cfg.use_film:
         count_parameters(vla.vision_backbone, "vla.vision_backbone (original)")
 
@@ -1009,7 +1011,11 @@ def finetune(cfg: FinetuneConfig) -> None:
         raw_backbone.load_state_dict(state_dict)  # 只加载原始视觉主干，不加载 FiLM 部分
 
     raw_backbone.to(device_id)
-# === 初始化 proprio 投影器 ===
+    
+    # Wrap VLA with DDP
+    #vla = wrap_ddp(vla, device_id, find_unused=True)
+    
+    # If applicable, instantiate proprio projector
     if cfg.use_proprio:
         proprio_projector = init_module(
             ProprioProjector,
@@ -1019,7 +1025,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             {"llm_dim": vla.llm_dim, "proprio_dim": PROPRIO_DIM},
         )
 
-# === 初始化 L1 Regression 头 ===
+    # If applicable, instantiate continuous action head for L1 regression
     if cfg.use_l1_regression:
         action_head = init_module(
             L1RegressionActionHead,
@@ -1180,7 +1186,6 @@ def finetune(cfg: FinetuneConfig) -> None:
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
         vla.train() 
         for batch_idx, batch in enumerate(dataloader):
-            #print("Batch keys:", batch.keys()) #####
             # Compute training metrics and loss
             compute_diffusion_l1 = cfg.use_diffusion and batch_idx % cfg.diffusion_sample_freq == 0
             loss, metrics = run_forward_pass(
@@ -1209,11 +1214,11 @@ def finetune(cfg: FinetuneConfig) -> None:
             normalized_loss.backward()
             
             # === 打印实时 loss（每 N 步打印一次） ===
-            if batch_idx % 20 == 0:  # 比如每10个 batch 打印一次
-                print(f"[batch {batch_idx}] normalized_loss={normalized_loss.item():.6f} raw_loss={loss.item():.6f}")
+            #if batch_idx % 20 == 0:  # 比如每20个 batch 打印一次
+            #    print(f"[batch {batch_idx}] normalized_loss={normalized_loss.item():.6f} raw_loss={loss.item():.6f}")
             # 如果想看梯度大小：
-                grad_norm = torch.norm(torch.stack([p.grad.detach().norm() for p in vla.parameters() if p.grad is not None])).item()
-                print(f"  ┗━ grad_norm={grad_norm:.4f}")
+             #   grad_norm = torch.norm(torch.stack([p.grad.detach().norm() for p in vla.parameters() if p.grad is not None])).item()
+              #  print(f"  ┗━ grad_norm={grad_norm:.4f}")
 
             # Store recent train metrics
             for metric_name, value in metrics.items():
@@ -1230,6 +1235,11 @@ def finetune(cfg: FinetuneConfig) -> None:
             log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
             if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
                 log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
+                
+                # ✅ Log to TensorBoard
+                for metric_name, value in smoothened_metrics.items():
+                    tb_writer.add_scalar(f"VLA_Train/{metric_name}", value, global_step=log_step)
+
 
             # [If applicable] Linearly warm up learning rate from 10% to 100% of original
             if cfg.lr_warmup_steps > 0:
@@ -1254,26 +1264,21 @@ def finetune(cfg: FinetuneConfig) -> None:
                 scheduler.step()
                 optimizer.zero_grad()
                 progress.update()
-                #print(f"batch_idx: {batch_idx}, grad_accum_steps: {cfg.grad_accumulation_steps}")
-                #print("训练一轮，退出")
-                #sys.stdout.flush()
-                #return
-
+           
             # Save model checkpoint: either keep latest checkpoint only or all checkpoints
             if gradient_step_idx > 0 and log_step % cfg.save_freq == 0:
-                pass
-               # save_training_checkpoint(
-               #     cfg=cfg,
-               #     run_dir=run_dir,
-               #     log_step=log_step,
-               #     vla=vla,
-               #     processor=processor,
-               #     proprio_projector=proprio_projector if cfg.use_proprio else None,
-               #     noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
-               #     action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
-               #     train_dataset=train_dataset,
-               #     distributed_state=distributed_state,
-               # )
+                save_training_checkpoint(
+                    cfg=cfg,
+                    run_dir=run_dir,
+                    log_step=log_step,
+                    vla=vla,
+                    processor=processor,
+                    proprio_projector=proprio_projector if cfg.use_proprio else None,
+                    noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
+                    action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
+                    train_dataset=train_dataset,
+                    distributed_state=distributed_state,
+                )
 
             # Test model on validation set
             if cfg.use_val_set and log_step > 0 and log_step % cfg.val_freq == 0:
@@ -1298,6 +1303,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             if log_step == cfg.max_steps:
                 print(f"Max step {cfg.max_steps} reached! Stopping training...")
                 break
+                
+    tb_writer.close()
 
 
 if __name__ == "__main__":
