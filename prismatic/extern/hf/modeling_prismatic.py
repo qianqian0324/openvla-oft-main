@@ -435,8 +435,15 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         all_actions_mask = current_action_mask | next_actions_mask  # (B, seq_len)
         return all_actions_mask
 
-    def _process_vision_features(self, pixel_values, language_embeddings=None, use_film=False):
+    def _process_vision_features(self, pixel_values, language_embeddings=None, vision_tokens=None, use_film=False, use_motion_aware=False):
         """Process vision features with optional FiLM conditioning"""
+        # ✅ 优先使用外部提供的 vision_tokens（比如 FiLM 输出）
+        if use_motion_aware:
+            if vision_tokens is not None:
+                assert vision_tokens.ndim == 3, f"Expected (B, N, D), got {vision_tokens.shape}"
+                return self.projector(vision_tokens)
+
+        # ✅ 否则走视觉主干（pixel_values 路径）
         if use_film:
             # FiLM: Infuse language inputs into visual features
             patch_features = self.vision_backbone(pixel_values, language_embeddings)  # (bsz, 256 * num_images, D)
@@ -514,7 +521,9 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         noisy_actions=None,
         noisy_action_projector=None,
         diffusion_timestep_embeddings=None,
+        vision_tokens: Optional[torch.FloatTensor] = None, ###
         use_film: bool = False,
+        use_motion_aware: bool = False,
     ) -> Union[Tuple, PrismaticCausalLMOutputWithPast]:
         """Run a forward pass through the VLM, returning a PrismaticCausalLMOutputWithPast instance."""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -583,7 +592,13 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             )  # (B, lang_seq_len, llm_dim)
 
             # Get visual features
-            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+            projected_patch_embeddings = self._process_vision_features(
+                pixel_values=pixel_values,
+                language_embeddings=language_embeddings,
+                vision_tokens=vision_tokens,
+                use_film=use_film,
+                use_motion_aware=use_motion_aware,
+            )
 
             # Add proprioceptive state if provided
             projected_patch_embeddings = self._process_proprio_features(

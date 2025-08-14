@@ -27,6 +27,7 @@ from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq,
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import wandb
+from torch.utils.tensorboard import SummaryWriter
 
 from experiments.robot.openvla_utils import (
     check_model_logic_mismatch,
@@ -34,6 +35,7 @@ from experiments.robot.openvla_utils import (
     update_auto_map,
 )
 
+from prismatic.models.modulation import ModulatedVisionEncoder, MotionEncoder, FiLMModulator
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
@@ -58,21 +60,20 @@ from prismatic.vla.constants import (
     NUM_ACTIONS_CHUNK,
     PROPRIO_DIM,
 )
-from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
+from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset, MotionAwareBatchTransform
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
-
+from scripts.extern import custom_repr
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
+os.environ["WANDB_MODE"] = "offline"
 
 @dataclass
 class FinetuneConfig:
     # fmt: off
-    vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
-
+    vla_path: str = "/home/QWJ/openvla-oft/openvla-7b-oft-finetuned-libero-object"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
     # Dataset
-    data_root_dir: Path = Path("datasets/rlds")      # Directory containing RLDS datasets
-    dataset_name: str = "aloha_scoop_x_into_bowl"    # Name of fine-tuning dataset (e.g., `aloha_scoop_x_into_bowl`)
+    data_root_dir: Path = Path("/home/QWJ/openvla-oft/openvla-oft-main/datasets")      # Directory containing RLDS datasets
+    dataset_name: str = "libero_object_no_noops"    # Name of fine-tuning dataset (e.g., `aloha_scoop_x_into_bowl`)
     run_root_dir: Path = Path("runs")                # Path to directory to store logs & checkpoints
     shuffle_buffer_size: int = 100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
 
@@ -81,6 +82,7 @@ class FinetuneConfig:
     use_diffusion: bool = False                      # If True, trains continuous action head with diffusion modeling objective (DDIM)
     num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
+    use_motion_aware: bool = True                           # If True, uses Move to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
 
@@ -278,6 +280,7 @@ def run_forward_pass(
     use_diffusion,
     use_proprio,
     use_film,
+    use_motion_aware,
     num_patches,
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
@@ -323,21 +326,63 @@ def run_forward_pass(
     else:
         noise, noisy_actions, diffusion_timestep_embeddings = None, None, None
 
-    # VLA forward pass
+    # ========== 视觉输入处理 ==========
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        output: CausalLMOutputWithPast = vla(
-            input_ids=batch["input_ids"].to(device_id),
-            attention_mask=batch["attention_mask"].to(device_id),
-            pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
-            labels=batch["labels"],
-            output_hidden_states=True,
-            proprio=batch["proprio"] if use_proprio else None,
-            proprio_projector=proprio_projector if use_proprio else None,
-            noisy_actions=noisy_actions if use_diffusion else None,
-            noisy_action_projector=noisy_action_projector if use_diffusion else None,
-            diffusion_timestep_embeddings=diffusion_timestep_embeddings if use_diffusion else None,
-            use_film=use_film,
-        )
+        if use_motion_aware:
+            # 提取 motion_chunk 和 appearance_frame
+            motion_chunk = batch["motion_chunk"].to(device_id, dtype=torch.bfloat16)             # (B, 4, 2, H, W)
+            appearance_frame = batch["appearance_frame"].to(device_id, dtype=torch.bfloat16)     # (B, 3, H, W)
+            input_ids = batch["input_ids"].to(device_id) ###
+            # 打印 appearance_frame 和 motion_chunk 的形状
+            #print(f"appearance_frame shape: {appearance_frame.shape}")
+            #print(f"motion_chunk shape: {motion_chunk.shape}")
+            # assert appearance_frame.ndim == 4 and appearance_frame.shape[1] == 3, "Expected image_tensor shape (B, 3, H, W)"
+            assert motion_chunk.ndim == 5 and motion_chunk.shape[2] == 2, "Expected flow_tensor shape (B, T, 2, H, W)"
+            #print("Type of modulated_vision_encoder:", type(base_model.modulated_vision_encoder))
+            
+            # 获取 FiLM 调制后 token
+            # TODO 当input_image_num为2时需要输入腕部相机的数据,考虑使用batch中的pixel_value信息作为填充,这边衔接还要继续做修改
+            # vision_tokens = vla.module.modulated_vision_encoder(
+            #     image_tensor=batch["pixel_values"][:6],
+            #     flow_tensor=motion_chunk,
+            #     wrist_tensor=batch["pixel_values"][6:]
+            # )
+            vision_tokens = vla.module.modulated_vision_encoder(
+                image_tensor=appearance_frame,
+                flow_tensor=motion_chunk
+            )
+            vision_tokens = vision_tokens.to(device_id)
+
+            output: CausalLMOutputWithPast = vla(
+                input_ids=batch["input_ids"].to(device_id),
+                attention_mask=batch["attention_mask"].to(device_id),
+                pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
+                vision_tokens=vision_tokens,
+                labels=batch["labels"],
+                output_hidden_states=True,
+                proprio=batch["proprio"] if use_proprio else None,
+                proprio_projector=proprio_projector if use_proprio else None,
+                noisy_actions=noisy_actions if use_diffusion else None,
+                noisy_action_projector=noisy_action_projector if use_diffusion else None,
+                diffusion_timestep_embeddings=diffusion_timestep_embeddings if use_diffusion else None,
+                use_film=use_film,
+                use_motion_aware=use_motion_aware,
+            )
+            
+        else:
+            output: CausalLMOutputWithPast = vla(
+                input_ids=batch["input_ids"].to(device_id),
+                attention_mask=batch["attention_mask"].to(device_id),
+                pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
+                labels=batch["labels"],
+                output_hidden_states=True,
+                proprio=batch["proprio"] if use_proprio else None,
+                proprio_projector=proprio_projector if use_proprio else None,
+                noisy_actions=noisy_actions if use_diffusion else None,
+                noisy_action_projector=noisy_action_projector if use_diffusion else None,
+                diffusion_timestep_embeddings=diffusion_timestep_embeddings if use_diffusion else None,
+                use_film=use_film,
+            )
 
     # Get action masks needed for logging
     ground_truth_token_ids = batch["labels"][:, 1:].to(device_id)
@@ -639,10 +684,16 @@ def save_training_checkpoint(
         if (cfg.use_l1_regression or cfg.use_diffusion) and action_head is not None:
             torch.save(action_head.state_dict(), checkpoint_dir / f"action_head--{checkpoint_name_suffix}")
 
+        #TODO 修改新的保存逻辑
         if cfg.use_film:
             # To be safe, just save the entire vision backbone (not just FiLM components)
             torch.save(
                 vla.module.vision_backbone.state_dict(), checkpoint_dir / f"vision_backbone--{checkpoint_name_suffix}"
+            )
+        
+        if cfg.use_motion_aware:
+            torch.save(
+                vla.module.modulated_vision_encoder.state_dict(), checkpoint_dir / f"modulated_vision_encoder--{checkpoint_name_suffix}"
             )
 
     # Wait for model components to be saved
@@ -782,6 +833,9 @@ def finetune(cfg: FinetuneConfig) -> None:
     run_dir = cfg.run_root_dir / run_id
     os.makedirs(run_dir, exist_ok=True)
 
+    # Initialize TensorBoard writer TODO need to change to lpai use
+    tb_writer = SummaryWriter(log_dir=str(run_dir)+"/tsboard")
+
     # GPU setup
     distributed_state = PartialState()
     device_id = distributed_state.local_process_index
@@ -830,10 +884,18 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Wait for model files to be synced
     dist.barrier()
 
+    # # TODO 检查是否有必要
+    # config = AutoConfig.from_pretrained(cfg.vla_path, trust_remote_code=True)
+    # config.use_fused_vision_backbone = False  # ✅ 强制使用单图像视觉主干
+    # #print("[DEBUG] LLaMA hidden size:", config.text_config.hidden_size)
+    # #print("[DEBUG] Loaded config model_type:", config.model_type)
+    # #print("[DEBUG] Hidden size:", config.text_config.hidden_size)
+    # #print("[DEBUG] use_fused_vision_backbone:", config.use_fused_vision_backbone)
     # Load processor and VLA
     processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
     vla = AutoModelForVision2Seq.from_pretrained(
         cfg.vla_path,
+        # config=config,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
@@ -856,6 +918,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # FiLM setup
     if cfg.use_film:
+        assert not cfg.use_motion_aware, "avoid use film when motion aware is on"
         count_parameters(vla.vision_backbone, "vla.vision_backbone (original)")
         # Wrap vision backbone with FiLM wrapper
         # Important: For this, must specify `vla.model.vision_backbone` instead of just `vla.vision_backbone`, since the
@@ -870,6 +933,28 @@ def finetune(cfg: FinetuneConfig) -> None:
             state_dict = load_checkpoint("vision_backbone", cfg.vla_path, cfg.resume_step)
             vla.model.vision_backbone.load_state_dict(state_dict)
         vla.model.vision_backbone = vla.model.vision_backbone.to(device_id)
+
+    # Move setup
+    if cfg.use_motion_aware:
+        count_parameters(vla.vision_backbone, "vla.vision_backbone (original)")
+        # 创建 ModulatedVisionEncoder
+        modulated_encoder = ModulatedVisionEncoder(
+            vision_backbone=vla.model.vision_backbone,
+            llm_dim=vla.llm_dim,
+        )
+
+        vla.model.modulated_vision_encoder = modulated_encoder
+        #print("[DEBUG] 模型主干类型:", type(base_model.modulated_vision_encoder))
+        #print("当前 vla.vision_backbone 类型:", type(vla.vision_backbone))
+        #print("base_model.modulated_vision_encoder 类型:", type(base_model.modulated_vision_encoder))
+    
+        count_parameters(modulated_encoder, "modulated_vision_encoder")
+
+        # 加载 resume 权重,将整个结构复制回来
+        if cfg.resume:
+            state_dict = load_checkpoint("modulated_vision_encoder", cfg.vla_path, cfg.resume_step)
+            modulated_encoder.load_state_dict(state_dict)
+        modulated_encoder = modulated_encoder.to(device_id)
 
     # Wrap VLA with DDP
     vla = wrap_ddp(vla, device_id, find_unused=True)
@@ -967,7 +1052,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     use_wrist_image = cfg.num_images_in_input > 1
 
     # Create training and optional validation datasets
-    batch_transform = RLDSBatchTransform(
+    batch_transform = MotionAwareBatchTransform(
         action_tokenizer,
         processor.tokenizer,
         image_transform=processor.image_processor.apply_transform,
@@ -1047,6 +1132,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 use_diffusion=cfg.use_diffusion,
                 use_proprio=cfg.use_proprio,
                 use_film=cfg.use_film,
+                use_motion_aware=cfg.use_motion_aware,
                 num_patches=NUM_PATCHES,
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
@@ -1055,8 +1141,10 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Normalize loss to account for gradient accumulation
             normalized_loss = loss / cfg.grad_accumulation_steps
 
-            # Backward pass
-            normalized_loss.backward()
+            # Enable anomaly detection for debugging inplace operations
+            with torch.autograd.set_detect_anomaly(True):
+                # Backward pass
+                normalized_loss.backward()
 
             # Store recent train metrics
             for metric_name, value in metrics.items():
@@ -1073,6 +1161,11 @@ def finetune(cfg: FinetuneConfig) -> None:
             log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
             if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
                 log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
+                
+                # ✅ Log to TensorBoard
+                for metric_name, value in smoothened_metrics.items():
+                    tb_writer.add_scalar(f"VLA_Train/{metric_name}", value, global_step=log_step)
+
 
             # [If applicable] Linearly warm up learning rate from 10% to 100% of original
             if cfg.lr_warmup_steps > 0:
@@ -1136,6 +1229,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             if log_step == cfg.max_steps:
                 print(f"Max step {cfg.max_steps} reached! Stopping training...")
                 break
+                
+    tb_writer.close()
 
 
 if __name__ == "__main__":

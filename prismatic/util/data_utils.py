@@ -151,6 +151,11 @@ class PaddedCollatorForActionPrediction:
             labels=labels,
             actions=actions,
         )
+        if "motion_chunk" in instances[0]:
+            output["motion_chunk"] = torch.stack([instance["motion_chunk"] for instance in instances])
+        if "appearance_frame" in instances[0]:
+            output["appearance_frame"] = torch.stack([instance["appearance_frame"] for instance in instances])
+            
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
         return output
