@@ -504,8 +504,7 @@ def make_interleaved_dataset(
         data_kwargs = copy.deepcopy(dataset_kwargs)
         if "dataset_frame_transform_kwargs" in data_kwargs:
             data_kwargs.pop("dataset_frame_transform_kwargs")
-            
-        _, dataset_statistics = make_dataset_from_rlds(**data_kwargs, train=train) 
+        _, dataset_statistics = make_dataset_from_rlds(**data_kwargs, train=train)
         dataset_sizes.append(dataset_statistics["num_transitions"])
         all_dataset_statistics[dataset_kwargs["name"]] = dataset_statistics
 
@@ -520,8 +519,8 @@ def make_interleaved_dataset(
 
     # Effective Dataset Length = Number of samples until each dataset has completed at least one epoch
     #   =>> Note :: Only counting the "primary" datasets (i.e., datasets with sample_weight == 1.0)
-    #dataset_len = int((np.array(dataset_sizes) / sample_weights)[primary_dataset_indices].max())   ############
-    dataset_len = int((np.array(dataset_sizes) / sample_weights)[primary_dataset_indices.astype(int)].max())
+    dataset_len = int((np.array(dataset_sizes) / sample_weights)[primary_dataset_indices].max())   ############
+    # dataset_len = int((np.array(dataset_sizes) / sample_weights)[primary_dataset_indices.astype(int)].max())
 
     # Allocate Threads based on Weights
     threads_per_dataset = allocate_threads(traj_transform_threads, sample_weights)

@@ -28,12 +28,7 @@ def make_oxe_dataset_kwargs(
     action_proprio_normalization_type = ACTION_PROPRIO_NORMALIZATION_TYPE,
 ) -> Dict[str, Any]:
     """Generates config (kwargs) for given dataset from Open-X Embodiment."""
-    #dataset_kwargs = deepcopy(OXE_DATASET_CONFIGS[dataset_name])
-    if dataset_name not in OXE_DATASET_CONFIGS:  ###
-        dataset_kwargs = {"dataset_name": dataset_name}  # minimal config
-    else: ###
-        dataset_kwargs = deepcopy(OXE_DATASET_CONFIGS[dataset_name])
-        
+    dataset_kwargs = deepcopy(OXE_DATASET_CONFIGS[dataset_name])
     if dataset_kwargs["action_encoding"] not in [ActionEncoding.EEF_POS, ActionEncoding.EEF_R6, ActionEncoding.JOINT_POS_BIMANUAL]:
         raise ValueError(f"Cannot load `{dataset_name}`; only EEF_POS & EEF_R6 & JOINT_POS_BIMANUAL actions supported!")
 
@@ -80,7 +75,6 @@ def make_oxe_dataset_kwargs(
     # Add any aux arguments
     if "aux_kwargs" in dataset_kwargs:
         dataset_kwargs.update(dataset_kwargs.pop("aux_kwargs"))
-        
 
     return {"name": dataset_name, "data_dir": str(data_root_dir), **dataset_kwargs}
 
@@ -108,7 +102,6 @@ def get_oxe_dataset_kwargs_and_weights(
 
     return: Tuple of (per_dataset_kwargs, sampling_weights)
     """
-    
     included_datasets, filtered_mixture_spec = set(), []
     for d_name, d_weight in mixture_spec:
         if d_name in included_datasets:

@@ -335,19 +335,15 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 f"there might be inference-time regressions due to dependency changes. If in doubt, please"
                 f"use the above versions."
             )
-        config.use_fused_vision_backbone = False
+
         # Instantiate PrismaticVisionBackbone (w/ Potential Fused Backbone)
         self.vision_backbone = PrismaticVisionBackbone(
-            use_fused_vision_backbone=config.use_fused_vision_backbone, 
-            image_sizes=config.image_sizes, 
-            timm_model_ids=config.timm_model_ids, 
-            timm_override_act_layers=config.timm_override_act_layers,
+            config.use_fused_vision_backbone, config.image_sizes, config.timm_model_ids, config.timm_override_act_layers
         )
-        self.vision_backbone.num_images_in_input = 1
 
         # Create Multimodal Projector
         self.projector = PrismaticProjector(
-            use_fused_vision_backbone=config.use_fused_vision_backbone,
+            config.use_fused_vision_backbone,
             vision_dim=self.vision_backbone.embed_dim,
             llm_dim=config.text_config.hidden_size,
         )
@@ -439,30 +435,24 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         all_actions_mask = current_action_mask | next_actions_mask  # (B, seq_len)
         return all_actions_mask
 
-    def _process_vision_features(
-        self,
-        pixel_values=None,
-        language_embeddings=None,
-        vision_tokens=None,  # ✅ 新增参数
-        use_film=False
-    ):
-        """Process vision features with optional FiLM conditioning or direct vision_tokens"""
+    def _process_vision_features(self, pixel_values, language_embeddings=None, vision_tokens=None, use_film=False, use_motion_aware=False):
+        """Process vision features with optional FiLM conditioning"""
+        # ✅ 优先使用外部提供的 vision_tokens（比如 FiLM 输出）
+        if use_motion_aware:
+            if vision_tokens is not None:
+                assert vision_tokens.ndim == 3, f"Expected (B, N, D), got {vision_tokens.shape}"
+                return self.projector(vision_tokens)
 
-    # ✅ 优先使用外部提供的 vision_tokens（比如 FiLM 输出）
-        if vision_tokens is not None:
-            assert vision_tokens.ndim == 3, f"Expected (B, N, D), got {vision_tokens.shape}"
-            return vision_tokens
-
-    # ✅ 否则走视觉主干（pixel_values 路径）
+        # ✅ 否则走视觉主干（pixel_values 路径）
         if use_film:
-        # FiLM: Infuse language inputs into visual features
-            patch_features = self.vision_backbone(pixel_values, language_embeddings)  # (B, N, D)
+            # FiLM: Infuse language inputs into visual features
+            patch_features = self.vision_backbone(pixel_values, language_embeddings)  # (bsz, 256 * num_images, D)
         else:
-            patch_features = self.vision_backbone(pixel_values)  # (B, N, D)
+            patch_features = self.vision_backbone(pixel_values)  # (bsz, 256 * num_images, D)
 
-    # Project patch embeddings into language embedding space
-        return self.projector(patch_features, language_embeddings)
-        
+        # Project patch embeddings into language embedding space
+        return self.projector(patch_features)
+
     def _process_proprio_features(self, projected_patch_embeddings, proprio, proprio_projector):
         """Process proprioceptive features and append to vision features"""
         if proprio_projector is not None and proprio is not None:
@@ -533,6 +523,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         diffusion_timestep_embeddings=None,
         vision_tokens: Optional[torch.FloatTensor] = None, ###
         use_film: bool = False,
+        use_motion_aware: bool = False,
     ) -> Union[Tuple, PrismaticCausalLMOutputWithPast]:
         """Run a forward pass through the VLM, returning a PrismaticCausalLMOutputWithPast instance."""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -606,7 +597,9 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 language_embeddings=language_embeddings,
                 vision_tokens=vision_tokens,
                 use_film=use_film,
+                use_motion_aware=use_motion_aware,
             )
+
             # Add proprioceptive state if provided
             projected_patch_embeddings = self._process_proprio_features(
                 projected_patch_embeddings, proprio, proprio_projector
@@ -639,7 +632,9 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             else:
                 # Replace the embeddings of the action tokens with zeros
                 # (Later on, the positional embeddings will be added to them)
-                all_actions_mask = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
+                all_actions_mask = all_actions_mask.unsqueeze(-1).to(
+                    input_embeddings.device, dtype=torch.bool
+                )  # (B, seq_len, 1)# (B, seq_len, 1)
                 input_embeddings = input_embeddings * ~all_actions_mask
 
             # Build multimodal embeddings & attention mask
@@ -1020,15 +1015,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         language_embeddings = input_embeddings[~all_actions_mask].reshape(
             input_embeddings.shape[0], -1, input_embeddings.shape[2]
         )
-        
-        # 显式传入 pixel_values 和 vision_tokens
-        projected_patch_embeddings = self._process_vision_features(
-            pixel_values=pixel_values,
-            language_embeddings=language_embeddings,
-            vision_tokens=vision_tokens,
-            use_film=use_film
-        )
-        
+
+        # Process vision features
+        projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+
         # Add proprioceptive features if provided
         use_proprio = proprio_projector is not None and proprio is not None
         if use_proprio:

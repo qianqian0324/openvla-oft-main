@@ -52,7 +52,6 @@ VISION_BACKBONES = {
 
 # === Language Model Registry ===
 LLM_BACKBONES = {
-    
     # === LLaMa-2 Pure (Non-Chat) Backbones ===
     "llama2-7b-pure": {"cls": LLaMa2LLMBackbone, "kwargs": {}},
     "llama2-13b-pure": {"cls": LLaMa2LLMBackbone, "kwargs": {}},
@@ -94,7 +93,6 @@ def get_vision_backbone_and_transform(
 
 def get_llm_backbone_and_tokenizer(
     llm_backbone_id: str,
-    vlm_config,  # 
     llm_max_length: int = 2048,
     hf_token: Optional[str] = None,
     inference_mode: bool = False,

@@ -8,10 +8,10 @@ format to OpenVLA, IterableDataset shim.
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Tuple, Type, Optional, List
+import os
 
 import numpy as np
 import torch
-import glob ###
 from PIL import Image
 from torch.utils.data import Dataset, IterableDataset
 from transformers import PreTrainedTokenizerBase
@@ -37,16 +37,17 @@ class RLDSBatchTransform:
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
-        dataset_name, current_action = rlds_batch["dataset_name"], rlds_batch["action"][0]
-        img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
+        actions = rlds_batch["action"][-NUM_ACTIONS_CHUNK:]
+        dataset_name, current_action = rlds_batch["dataset_name"], actions[0]
+        img = Image.fromarray(rlds_batch["observation"]["image_primary"][-1])
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
-        actions = rlds_batch["action"]
+
 
         # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens
         prompt_builder = self.prompt_builder_fn("openvla")
 
         # Get future action chunk
-        future_actions = rlds_batch["action"][1:]
+        future_actions = actions[1:]
         future_actions_string = ''.join(self.action_tokenizer(future_actions))
 
         # Get action chunk string
@@ -76,52 +77,36 @@ class RLDSBatchTransform:
             labels[-1] = IGNORE_INDEX
 
         return_dict = dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions)
-        
-        # Extract motion_chunk and appearance_frame
-        # Ensure these keys are present in the batch
-        motion, frame = extract_motion_and_frame(rlds_batch["episode"], rlds_batch["center_idx"])
-        return_dict["motion_chunk"] = torch.tensor(motion, dtype=torch.float32)  # shape: (T, 2, H, W)
-        return_dict["appearance_frame"] = torch.tensor(frame, dtype=torch.float32).permute(2, 0, 1) / 255.0  # shape: (3, H, W)
 
         # Add additional inputs
         if self.use_wrist_image:
             all_wrist_pixels = []
             for k in rlds_batch["observation"].keys():
                 if "wrist" in k:
-                    img_wrist = Image.fromarray(rlds_batch["observation"][k][0])
+                    img_wrist = Image.fromarray(rlds_batch["observation"][k][-1])
                     pixel_values_wrist = self.image_transform(img_wrist)
                     all_wrist_pixels.append(pixel_values_wrist)
             return_dict["pixel_values_wrist"] = torch.cat(all_wrist_pixels, dim=0)
         if self.use_proprio and "proprio" in rlds_batch["observation"]:
-            proprio = rlds_batch["observation"]["proprio"]
+            proprio = rlds_batch["observation"]["proprio"][-1:]
             return_dict["proprio"] = proprio
 
         return return_dict
-        
+
 
 class MotionAwareBatchTransform(RLDSBatchTransform):
-    def __call__(self, example):
+    def __call__(self, rlds_batch):
         # 先执行父类转换（获取已有字段，如 action、proprio、input_ids 等）
-        batch = super().__call__(example)
+        batch = super().__call__(rlds_batch)
 
         # 提取 motion_chunk 和 appearance_frame（来自你的自定义函数）
-        motion, frame = extract_motion_and_frame(example["episode"], example["center_idx"])
-        
+        frame_set = rlds_batch["observation"]["image_primary"]
+        motion, frame = extract_motion_and_frame(frame_set, len(frame_set)-1)
         # 注意：motion 本身就是 float32 类型，可能已经是 [0, 1] 或 [0, 255]
         # 如果 motion 来自 RGB/光流图像，记得归一化；如果是光流矢量，不需要归一化
-        motion_tensor = torch.tensor(motion, dtype=torch.bfloat16)             # (T, 2, H, W)
-
+        batch["motion_chunk"]  = torch.tensor(motion, dtype=torch.bfloat16)             # (T, 2, H, W)
         # 归一化 RGB 图像（H, W, 3）→ (3, H, W)，归一化到 0~1
-        frame_tensor = torch.tensor(frame, dtype=torch.float32).permute(2, 0, 1) / 255.0
-
-        # 添加到 batch 中
-        batch["motion_chunk"] = motion_tensor
-        batch["appearance_frame"] = frame_tensor
-
-        #print("motion_chunk shape:", motion_tensor.shape)
-        #print("appearance_frame shape:", frame_tensor.shape)
-        #print("[DEBUG] MotionAwareBatchTransform used.")
-        #print("[DEBUG] Output keys from batch_transform:", batch.keys())
+        batch["appearance_frame"]  = torch.tensor(frame, dtype=torch.float32).permute(2, 0, 1) / 255.0
 
         return batch
         
@@ -139,11 +124,13 @@ class RLDSDataset(IterableDataset):
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
-     
+
+        # Configure RLDS Dataset(s)
         if self.data_mix in OXE_NAMED_MIXTURES:
             mixture_spec = OXE_NAMED_MIXTURES[self.data_mix]
         else:
-            mixture_spec = [(self.data_mix, 1.0)]  # Single dataset mix
+            # Assume that passed "mixture" name is actually a single dataset -- create single-dataset "mix"
+            mixture_spec = [(self.data_mix, 1.0)]
 
         # fmt: off
         if "aloha" in self.data_mix:
@@ -162,7 +149,7 @@ class RLDSDataset(IterableDataset):
         )
         rlds_config = dict(
             traj_transform_kwargs=dict(
-                window_size=1,                                      # If we wanted to feed / predict more than one step
+                window_size=5,                                      # If we wanted to feed / predict more than one step
                 future_action_window_size=NUM_ACTIONS_CHUNK-1,      # For action chunking
                 skip_unlabeled=True,                                # Skip trajectories without language labels
                 goal_relabeling_strategy="uniform",                 # Goals are currently unused
@@ -204,34 +191,10 @@ class RLDSDataset(IterableDataset):
     def make_dataset(self, rlds_config):
         return make_interleaved_dataset(**rlds_config)
 
-    #def __iter__(self) -> Dict[str, Any]:
-    #    for rlds_batch in self.dataset.as_numpy_iterator():
-    #        yield self.batch_transform(rlds_batch)
     def __iter__(self) -> Dict[str, Any]:
-        sliding_window = []
-        window_size = 5  # For motion_chunk = 4 flows (t-3, t-2, t-1, t), appearance_frame = t
+        for rlds_batch in self.dataset.as_numpy_iterator():
+            yield self.batch_transform(rlds_batch)
 
-        for rlds_step in self.dataset.as_numpy_iterator():
-            sliding_window.append(rlds_step)
-
-        # 滑动窗口不足5帧时跳过
-            if len(sliding_window) < window_size:
-                continue
-            if len(sliding_window) > window_size:
-                sliding_window.pop(0)
-
-        # 构造 episode（只提取 image 字段用于 optical flow）
-            episode = [{"image": step["observation"]["image_primary"]} for step in sliding_window]
-            center_idx = 4  # 滑窗中心帧
-
-        # 添加给 MotionAwareBatchTransform 使用的字段
-            rlds_step["episode"] = episode
-            rlds_step["center_idx"] = center_idx
-            
-            #print(f"Yielding batch with {len(episode)} frames.")
-
-            yield self.batch_transform(rlds_step)
-            
     def __len__(self) -> int:
         return self.dataset_length
 
@@ -258,7 +221,7 @@ class EpisodicRLDSDataset(RLDSDataset):
         for rlds_batch in self.dataset.as_numpy_iterator():
             out = [
                 self.batch_transform(tree_map(lambda x: x[i], rlds_batch))  # noqa: B023
-                for i in range(rlds_batch["action"].shape[0])
+                for i in range(rlds_batch["action"].shape[0])  # this may makes problem when window_size is not equal 1
             ]
             yield out
 

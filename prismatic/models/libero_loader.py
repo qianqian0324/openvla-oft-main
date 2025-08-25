@@ -27,7 +27,7 @@ def load_raft_model(model_path, small=True):
     model.eval()
     return model
 # weight路径
-raft_model = load_raft_model("/home/chenlin/QWJ/openvla-oft-main/prismatic/models/raftt/model/raft-small.pth", small=True)
+raft_model = load_raft_model("prismatic/models/raftt/model/raft-small.pth", small=True)
 
 @torch.no_grad()
 def compute_optical_flow_raft(prev_img, next_img):
@@ -62,9 +62,7 @@ def extract_motion_and_frame(
         raise ValueError(f"非法中心帧索引 center_idx={center_idx}，需满足 [4, len-1]")
 
     rgb_seq = []
-    for step in episode:
-        img = step["image"]
-
+    for img in episode:
         if img.ndim == 4 and img.shape[0] == 1:
             img = np.squeeze(img, axis=0)
 
