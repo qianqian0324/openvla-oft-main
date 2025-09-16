@@ -35,7 +35,7 @@ from experiments.robot.openvla_utils import (
     update_auto_map,
 )
 
-from prismatic.models.modulation import ModulatedVisionEncoder, MotionEncoder, FiLMModulator
+from prismatic.models.modulation import ModulatedVisionEncoder, MotionEncoder, GatedFiLMModulator
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
@@ -62,7 +62,7 @@ from prismatic.vla.constants import (
 )
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset, MotionAwareBatchTransform
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
-from scripts.extern import custom_repr
+#from scripts.extern import custom_repr
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["WANDB_MODE"] = "offline"
@@ -75,7 +75,7 @@ class FinetuneConfig:
     data_root_dir: Path = Path("/home/QWJ/openvla-oft/openvla-oft-main/datasets")      # Directory containing RLDS datasets
     dataset_name: str = "libero_object_no_noops"    # Name of fine-tuning dataset (e.g., `aloha_scoop_x_into_bowl`)
     run_root_dir: Path = Path("runs")                # Path to directory to store logs & checkpoints
-    shuffle_buffer_size: int = 100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
+    shuffle_buffer_size: int = 10_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
 
     # Algorithm and architecture
     use_l1_regression: bool = True                   # If True, trains continuous action head with L1 regression objective
@@ -83,7 +83,7 @@ class FinetuneConfig:
     num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     use_motion_aware: bool = True                           # If True, uses Move to infuse language inputs into visual features
-    num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
+    num_images_in_input: int = 2                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
 
     # Training configuration
@@ -331,25 +331,23 @@ def run_forward_pass(
         if use_motion_aware:
             # 提取 motion_chunk 和 appearance_frame
             motion_chunk = batch["motion_chunk"].to(device_id, dtype=torch.bfloat16)             # (B, 4, 2, H, W)
-            appearance_frame = batch["appearance_frame"].to(device_id, dtype=torch.bfloat16)     # (B, 3, H, W)
-            input_ids = batch["input_ids"].to(device_id) ###
-            # 打印 appearance_frame 和 motion_chunk 的形状
-            #print(f"appearance_frame shape: {appearance_frame.shape}")
-            #print(f"motion_chunk shape: {motion_chunk.shape}")
-            # assert appearance_frame.ndim == 4 and appearance_frame.shape[1] == 3, "Expected image_tensor shape (B, 3, H, W)"
-            assert motion_chunk.ndim == 5 and motion_chunk.shape[2] == 2, "Expected flow_tensor shape (B, T, 2, H, W)"
-            #print("Type of modulated_vision_encoder:", type(base_model.modulated_vision_encoder))
+            pixel_values = batch["pixel_values"].to(device_id, dtype=torch.bfloat16)             
+            #print("pixel_values shape:", pixel_values.shape)
             
-            # 获取 FiLM 调制后 token
-            # TODO 当input_image_num为2时需要输入腕部相机的数据,考虑使用batch中的pixel_value信息作为填充,这边衔接还要继续做修改
-            # vision_tokens = vla.module.modulated_vision_encoder(
-            #     image_tensor=batch["pixel_values"][:6],
-            #     flow_tensor=motion_chunk,
-            #     wrist_tensor=batch["pixel_values"][6:]
-            # )
+            # ========= 可视化 =========
+            #from visualize_views import visualize_views
+            #if not hasattr(run_forward_pass, "visualized"):  
+            #    visualize_views(pixel_values)
+            #    run_forward_pass.visualized = True
+
+            assert motion_chunk.ndim == 5 and motion_chunk.shape[2] == 2, \
+                "Expected flow_tensor shape (B, T, 2, H, W)"
+            #print(repr(pixel_values))
+            # 调用 FiLM modulated encoder
             vision_tokens = vla.module.modulated_vision_encoder(
-                image_tensor=appearance_frame,
-                flow_tensor=motion_chunk
+                image_tensor=pixel_values[:, :6],   # 第三视角6通道
+                flow_tensor=motion_chunk,
+                wrist_tensor=pixel_values[:, 6:]    # 腕部6通道
             )
             vision_tokens = vision_tokens.to(device_id)
 
@@ -360,7 +358,7 @@ def run_forward_pass(
                 vision_tokens=vision_tokens,
                 labels=batch["labels"],
                 output_hidden_states=True,
-                proprio=batch["proprio"] if use_proprio else None,
+                proprio=batch["proprio"].to(next(vla.parameters()).device) if use_proprio else None,
                 proprio_projector=proprio_projector if use_proprio else None,
                 noisy_actions=noisy_actions if use_diffusion else None,
                 noisy_action_projector=noisy_action_projector if use_diffusion else None,
@@ -834,7 +832,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     os.makedirs(run_dir, exist_ok=True)
 
     # Initialize TensorBoard writer TODO need to change to lpai use
-    tb_writer = SummaryWriter(log_dir=str(run_dir)+"/tsboard")
+    tb_writer = SummaryWriter(log_dir=run_dir / "tsboard")
 
     # GPU setup
     distributed_state = PartialState()
@@ -884,13 +882,6 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Wait for model files to be synced
     dist.barrier()
 
-    # # TODO 检查是否有必要
-    # config = AutoConfig.from_pretrained(cfg.vla_path, trust_remote_code=True)
-    # config.use_fused_vision_backbone = False  # ✅ 强制使用单图像视觉主干
-    # #print("[DEBUG] LLaMA hidden size:", config.text_config.hidden_size)
-    # #print("[DEBUG] Loaded config model_type:", config.model_type)
-    # #print("[DEBUG] Hidden size:", config.text_config.hidden_size)
-    # #print("[DEBUG] use_fused_vision_backbone:", config.use_fused_vision_backbone)
     # Load processor and VLA
     processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
     vla = AutoModelForVision2Seq.from_pretrained(
@@ -940,12 +931,11 @@ def finetune(cfg: FinetuneConfig) -> None:
         # 创建 ModulatedVisionEncoder
         modulated_encoder = ModulatedVisionEncoder(
             vision_backbone=vla.model.vision_backbone,
+            num_images_in_input=cfg.num_images_in_input,  # 确保cfg.num_images_in_input=2
             llm_dim=vla.llm_dim,
         )
 
         vla.model.modulated_vision_encoder = modulated_encoder
-        #print("[DEBUG] 模型主干类型:", type(base_model.modulated_vision_encoder))
-        #print("当前 vla.vision_backbone 类型:", type(vla.vision_backbone))
         #print("base_model.modulated_vision_encoder 类型:", type(base_model.modulated_vision_encoder))
     
         count_parameters(modulated_encoder, "modulated_vision_encoder")
@@ -1162,7 +1152,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
                 log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
                 
-                # ✅ Log to TensorBoard
+                # Log to TensorBoard
                 for metric_name, value in smoothened_metrics.items():
                     tb_writer.add_scalar(f"VLA_Train/{metric_name}", value, global_step=log_step)
 

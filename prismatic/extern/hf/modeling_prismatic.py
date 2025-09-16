@@ -632,7 +632,9 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             else:
                 # Replace the embeddings of the action tokens with zeros
                 # (Later on, the positional embeddings will be added to them)
-                all_actions_mask = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
+                all_actions_mask = all_actions_mask.unsqueeze(-1).to(
+                    input_embeddings.device, dtype=torch.bool
+                )  # (B, seq_len, 1)# (B, seq_len, 1)
                 input_embeddings = input_embeddings * ~all_actions_mask
 
             # Build multimodal embeddings & attention mask

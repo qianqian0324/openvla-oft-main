@@ -96,17 +96,28 @@ class RLDSBatchTransform:
 
 class MotionAwareBatchTransform(RLDSBatchTransform):
     def __call__(self, rlds_batch):
-        # 先执行父类转换（获取已有字段，如 action、proprio、input_ids 等）
+        # 父类处理：action, input_ids, labels, pixel_values 等
         batch = super().__call__(rlds_batch)
 
-        # 提取 motion_chunk 和 appearance_frame（来自你的自定义函数）
+        # 第三视角 full_image (取最后一帧)
         frame_set = rlds_batch["observation"]["image_primary"]
-        motion, frame = extract_motion_and_frame(frame_set, len(frame_set)-1)
-        # 注意：motion 本身就是 float32 类型，可能已经是 [0, 1] 或 [0, 255]
-        # 如果 motion 来自 RGB/光流图像，记得归一化；如果是光流矢量，不需要归一化
-        batch["motion_chunk"]  = torch.tensor(motion, dtype=torch.bfloat16)             # (T, 2, H, W)
-        # 归一化 RGB 图像（H, W, 3）→ (3, H, W)，归一化到 0~1
-        batch["appearance_frame"]  = torch.tensor(frame, dtype=torch.float32).permute(2, 0, 1) / 255.0
+        motion, frame = extract_motion_and_frame(frame_set, len(frame_set) - 1)
+        full_img = torch.tensor(frame, dtype=torch.float32).permute(2, 0, 1) / 255.0
+        batch["full_image"] = full_img.unsqueeze(0)   # (1,3,H,W)
+
+        # 腕部视角 wrist_image (取最后一帧)
+        if self.use_wrist_image:
+            wrist_imgs = []
+            for k in rlds_batch["observation"].keys():
+                if "wrist" in k:
+                    img_wrist = Image.fromarray(rlds_batch["observation"][k][-1])
+                    wrist_imgs.append(self.image_transform(img_wrist))  # (3,H,W)
+            if wrist_imgs:
+                wrist_tensor = torch.stack(wrist_imgs, dim=0)   # (N,3,H,W)
+                batch["wrist_image"] = wrist_tensor[0:1]        # (1,3,H,W)
+
+        # 光流 motion_chunk (T,2,H,W)
+        batch["motion_chunk"] = torch.tensor(motion, dtype=torch.bfloat16)
 
         return batch
         
