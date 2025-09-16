@@ -42,25 +42,22 @@ dependencies = [
     "protobuf",
     "rich",
     "sentencepiece==0.1.99",
-    "pandas",                   # for debug
     "timm==0.9.10",
     "tokenizers==0.19.1",
     "torch==2.2.0",
     "torchvision==0.17.0",
     "torchaudio==2.2.0",
-    "transformers @ git+https://gitlab.chehejia.com/gaojuntao/transformers-openvla-oft.git",  # IMPORTANT: Use this fork for bidirectional attn (for parallel decoding)
+    "transformers @ file:/home/chenlin/QWJ/transformers-openvla-oft-main",  # IMPORTANT: Use this fork for bidirectional attn (for parallel decoding)
     "wandb",
     "tensorflow==2.15.0",
     "tensorflow_datasets==4.9.3",
     "tensorflow_graphics==2021.12.3",
-    "dlimp @ git+https://gitlab.chehejia.com/gaojuntao/dlimp_openvla",
+    "dlimp @ file:/home/chenlin/QWJ/dlimp_openvla-main",
     "diffusers",
     "imageio",
     "uvicorn",
     "fastapi",
     "json-numpy",
-    "pytorch_lightning",
-    "datasets",
 ]
 
 [project.optional-dependencies]
